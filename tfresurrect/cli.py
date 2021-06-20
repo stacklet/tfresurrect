@@ -3,39 +3,25 @@ import click
 from collections import defaultdict
 from graphlib import TopologicalSorter
 from c7n.resources import load_resources
-from c7n.resources.aws import Arn, ArnResolver
+from c7n.resources.aws import Arn, ArnResolver, AWS
 from c7n.policy import Policy
 from c7n.config import Config
 import jmespath
 import json
 import logging
 import hcl2
+import itertools
 import os
 import pprint
-from pytest_terraform.tf import TerraformRunner as BaseRunner
 from pathlib import Path
 import re
 import subprocess
 
+
+__author__ = "Kapil Thangavelu <kapil@stacklet.io>"
+
+
 log = logging.getLogger("tfresurrect")
-
-
-# this feels mostly superflous just call show directly and skip the dep
-class TerraformRunner(BaseRunner):
-
-    command_templates = dict(BaseRunner.command_templates)
-    command_templates["show"] = "show -json"
-    command_templates[
-        "import"
-    ] = "import {input} {color} {var_file} {logical_id} {physical_id}"
-
-    def show(self):
-        args = self._get_cmd_args("show")
-        return json.loads(
-            subprocess.check_output(
-                args, cwd=os.path.abspath(self.module_dir or self.work_dir)
-            )
-        )
 
 
 def get_env_resources(group):
@@ -54,8 +40,8 @@ def get_env_resources(group):
 
 
 def get_state_resources(tf_dir):
-    runner = TerraformRunner(work_dir=tf_dir, module_dir=tf_dir, tf_bin="terraform")
-    state = runner.show()
+    output = subprocess.check_output(["terraform", "show", "-json"], cwd=tf_dir)
+    state = json.loads(output)
     state_resources = {}
 
     resources = jmespath.search("values.root_module.resources", state) or ()
@@ -74,27 +60,104 @@ def get_hcl_resources(tf_dir):
     resources = {}
 
     for tf in Path(str(tf_dir)).rglob("**/*.tf"):
-        print(tf.name)
         tf_data = hcl2.loads(tf.read_text())
-        print(tf_data.keys())
         for r in tf_data.get("resource", ()):
             rtype = list(r.keys()).pop()
             for rname in r[rtype].keys():
                 rdef = r[rtype][rname]
-                physical_id = None
-                if "name" in rdef:
-                    physical_id = rdef["name"]
-                elif "identifier" in rdef:
-                    physical_id = rdef["id"]
-                elif "family" in rdef:
-                    physical_id = rdef["family"]
-                elif "description" in rdef:
-                    physical_id = rdef["description"]
-                else:
-                    # print(f'no identifier for {rtype}.{rname} \n {rdef}')
-                    continue
-                resources[f"{rtype}.{rname}"] = {"id": physical_id[0], "def": rdef}
+                resources[f"{rtype}.{rname}"] = {"def": rdef}
     return resources
+
+
+def sorted_graph(tresources):
+    """sort the dependencies by the resource graph dependency order
+
+    dependencies determined by references between resources.
+    """
+    graph = defaultdict(list)
+    for t in tresources:
+        tdef = tresources[t]["def"]
+        for r in get_refs(tdef):
+            if not r.startswith("aws"):
+                continue
+            graph[t].append(r)
+
+    ts = TopologicalSorter(graph)
+    sorder = list(ts.static_order())
+    # kms keys have no real user managed identity, minus an alias
+    # we can bind their identity from their aliases, so resort aliases
+    # first, by just moving kms keys to the rear
+    # rorder = [t for t in sorder if not t.startswith("aws_kms_key")]
+    # $[rorder.append(t) for t in sorder if t.startswith("aws_kms_key")]
+    # pprint.pprint(rorder)
+    return sorder
+
+
+TF_REF_REGEX = re.compile("\$\{(?P<ref>.*?)\}")
+
+
+def get_refs(tdef):
+    refs = []
+    for k, v in tdef.items():
+        for e in v:
+            if not isinstance(e, str):
+                continue
+            elif "${aws_" in e:
+                for r in TF_REF_REGEX.search(e).groups("ref"):
+                    if "aws" in r:
+                        refs.append(r.rsplit(".", 1)[0])
+            elif "aws_" in e:
+                refs.append(e)
+    return refs
+
+
+class VariableResolver:
+    # limited variable resolution and substution to get at string for identity fields
+    # at the moment we're not bothering with expressions evaluation on locals
+    # we expect the user to provide us an explicit locals mapping.
+
+    def __init__(self, tf_vars, tf_locals):
+        self.tf_vars = tf_vars
+        self.tf_locals = tf_locals
+
+    def resolve_identity(self, ident):
+        ident = self._resolve_variables(ident)
+        ident = self._resolve_locals(ident)
+        return ident
+
+    resolve = resolve_identity
+
+    @staticmethod
+    def get_regex(name, var=False, local=False):
+        assert var or local
+        if var:
+            return re.compile("((?:\$\{)?var[.]" + name + "(?:\})?)")
+        if local:
+            return re.compile("((?:\$\{)?local[.]" + name + "(?:\})?)")
+
+    def _resolve_variables(self, ident):
+        for k in sorted(self.tf_vars.keys(), key=lambda x: len(x), reverse=True):
+            if f"var.{k}" not in ident:
+                continue
+            regex = self.get_regex(k, var=True)
+            v = self.tf_vars[k]
+            if isinstance(v, list):
+                v = v[0]
+            if not isinstance(v, str):
+                v = json.dumps(v)
+            ident = regex.sub(v, ident)
+        return ident
+
+    def _resolve_locals(self, ident):
+        for k in sorted(self.tf_locals.keys(), key=lambda x: len(x), reverse=True):
+            if f"local.{k}" not in ident:
+                continue
+            v = self.tf_locals[k]
+            if isinstance(v, list):
+                v = v[0]
+            regex = self.get_regex(k, local=True)
+            ident = regex.sub(v, ident)
+        return ident
 
 
 class ResourceResolver:
@@ -103,18 +166,30 @@ class ResourceResolver:
     hcl_cfn_type_map = {
         "aws::security::group": "aws::ec2::securitygroup",
         "aws::db::instance": "aws::rds::dbinstance",
-        "aws::cloudwatch::event_rule": "aws::events::rule",
-        "aws::cloudwatch::log_group": "aws::logs::loggroup",
+        "aws::cloudwatch::eventrule": "aws::events::rule",
+        "aws::cloudwatch::loggroup": "aws::logs::loggroup",
         "aws::elasticache::subnet_group": "aws::elasticache::subnetgroup",
     }
 
     arn_imports = set()
 
-    def __init__(self, eresources, tresources, tstate, ident_map):
+    def __init__(self, var_resolver, eresources, tresources, tstate, ident_map):
+        #
+        # eresources - environment resources from cloud provider <cfn_type>: [arns]
+        #   - note this will be missing resources that resource groups don't support.
+        #   - for this we will directly use cloud custodian to fetch the resources.
+        # tresources - hcl resources definitions
+        # tstate - terraform state resources
+        # ident_map - manually mapped entries, escape hatch.
+        self.var_resolver = var_resolver
         self.eresources = eresources
         self.tresources = tresources
         self.tstate = tstate
         self.ident_map = ident_map
+        self._resolve_cache = {}
+        self._resource_cache = {}
+
+        # dynamic lookup
         self.rmanager = Policy(
             {"name": "resolver", "resource": "aws.ec2"}, Config.empty()
         ).resource_manager
@@ -122,24 +197,35 @@ class ResourceResolver:
 
     def get_cfn_type(self, logical_id):
         provider, rservice, rtype = logical_id.split(".", 1)[0].split("_", 2)
+        rtype = rtype.replace("_", "")
         etype = f"{provider}::{rservice}::{rtype}"
         return self.hcl_cfn_type_map.get(etype, etype)
 
-    def resolve(self, logical_id, hcl_ident):
-        # logical_id == aws_sqs_queue.trail_event_queue
-        # hcl_ident = name/id attribute with block, post variable resolution
+    def get_identity(self, rdef):
+        # default get identity from definition
+        physical_id = None
+        if "name" in rdef:
+            physical_id = rdef["name"]
+        elif "identifier" in rdef:
+            physical_id = rdef["id"]
+        return physical_id and physical_id[0] or None
 
+    def resolve(self, logical_id, rdef):
+        """
+        params:
+          logical_id == aws_sqs_queue.trail_event_queue
+          hcl_ident = name/id attribute with block, post variable resolution
+        """
         named_handler = "resolve_%s" % logical_id.split(".", 1)[0]
         resolver = getattr(self, named_handler, self.resolve_default)
-
-        result = resolver(logical_id, hcl_ident)
+        result = resolver(logical_id, rdef)
         if result is None:
-            # and not logical_id.split('.', 1)[0] in (
-            #    'aws_kms_alias', 'aws_iam_role_policy'):
-            print(f"resolve {logical_id} {hcl_ident} failed")
+            print(f"resolve {logical_id} failed")
+        else:
+            self._resolve_cache[logical_id] = result
         return result
 
-    def resolve_default(self, logical_id, hcl_ident, arn=False, multi=False):
+    def resolve_default(self, logical_id, rdef, arn=False, multi=False):
         # only works for things that are supported by aws resource group tagging.
         # - iam roles aren't returned by resource group tagging :(
         # - elasticache cache subnet groups :(
@@ -147,6 +233,11 @@ class ResourceResolver:
         #
         # review full sadness on partial support
         # https://docs.aws.amazon.com/ARG/latest/userguide/supported-resources.html
+        #
+
+        ident = self.get_identity(rdef)
+        assert ident, "no identity for resource"
+        hcl_ident = self.var_resolver.resolve_identity(ident)
         cfn_type = self.get_cfn_type(logical_id)
 
         if cfn_type not in self.eresources:
@@ -173,18 +264,139 @@ class ResourceResolver:
             return parsed_arn.resource
         return found
 
-    def resolve_aws_security_group(self, logical_id, hcl_ident):
-        candidates = self.resolve_default(logical_id, hcl_ident, multi=True)
-        sgs = self.rmanager.get_resource_manager("aws.security-group").get_resources(
-            [Arn.parse(c).resource for c in candidates]
-        )
+    def _resolve_resources(self, cfn_type, rids=None):
+        if cfn_type in self._resource_cache:
+            return self._resource_cache[cfn_type]
+        found = None
+        for rtype, v in AWS.resources.items():
+            if v.resource_type.cfn_type is None:
+                continue
+            if v.resource_type.cfn_type.lower() == cfn_type:
+                found = rtype
+                break
+        if found is None:
+            raise ValueError(
+                "could not find matching resource for cfn_type:%s" % cfn_type
+            )
+
+        kmanager = self.rmanager.get_resource_manager(rtype)
+        if not rids:
+            candidates = self.eresources.get(cfn_type, ())
+            if not candidates:
+                return None
+            rids = [Arn.parse(c).resource for c in candidates]
+        resources = kmanager.get_resources(rids)
+        self._resource_cache[cfn_type] = resources
+        return resources
+
+    def _value(self, rdef, key):
+        v = rdef.get(key)
+        if isinstance(v, list):
+            return v[0]
+
+    def resolve_aws_iam_role_policy_attachment(self, logical_id, rdef):
+        role_refs = get_refs({"role": rdef["role"]})
+        if role_refs:
+            role = self._resolve_cache[role_refs[0]]
+        else:
+            role = rdef["role"][0]
+        policy_refs = get_refs({"policy_arn": rdef["policy_arn"]})
+        if policy_refs:
+            policy = self._resolve_cache[policy_refs[0]]
+        else:
+            policy = rdef["policy_arn"][0]
+        return f"{role}/{policy}"
+
+    def resolve_aws_ecs_task_definition(self, logical_id, rdef):
+        tdefs = self._resolve_resources(self.get_cfn_type(logical_id))
+        family = self.var_resolver.resolve(rdef["family"][0])
+        for t in tdefs:
+            if t["family"] == family:
+                return t["taskDefinitionArn"]
+
+    def resolve_aws_security_group_rule(self, logical_id, rdef):
+        ref_sg_id = get_refs({"sg_id": rdef["security_group_id"]})[0]
+        sg_id = self._resolve_cache[ref_sg_id]
+        direction = rdef["type"][0]
+        protocol = rdef["protocol"][0]
+
+        source_group = get_refs({"sg": rdef.get("source_security_group_id", ())})
+        if source_group:
+            source_group = self._resolve_cache[source_group[0]]
+
+        blocks = []
+        for b in rdef.get("cidr_blocks", ()):
+            if isinstance(b, str):
+                b = [b]
+            for e in b:
+                if "var." in e:
+                    e = json.loads(self.var_resolver.resolve(e))
+                if isinstance(e, list):
+                    blocks.extend(e)
+                else:
+                    blocks.append(e)
+        if blocks:
+            cidr = "_".join(blocks)
+        if source_group:
+            cidr = source_group
+        from_port = rdef["from_port"][0]
+        to_port = rdef["to_port"][0]
+        return f"{sg_id}_{direction}_{protocol}_{from_port}_{to_port}_{cidr}"
+
+    def resolve_aws_iam_role_policy(self, logical_id, rdef):
+        role = self._resolve_cache[get_refs({"role": rdef["role"]})[0]]
+        name = self.var_resolver.resolve(rdef["name"][0])
+        return f"{role}:{name}"
+
+    def resolve_aws_kms_alias(self, logical_id, rdef):
+        return self.var_resolver.resolve(rdef["name"][0])
+
+    def resolve_aws_elasticache_replication_group(self, logical_id, rdef):
+        return self.var_resolver.resolve(rdef["replication_group_id"][0])
+
+    def resolve_aws_secretsmanager_secret_version(self, logical_id, rdef):
+        secret_ref = get_refs({"secret": rdef["secret_id"]})
+        if not secret_ref:
+            return None
+        secret_id = self._resolve_cache[secret_ref[0]]
+
+        name = secret_id.rsplit("-", 1)[0]
+        secrets = self._resolve_resources("aws::secretsmanager::secret", rids=(name,))
+        found = None
+        for s in secrets:
+            if s["ARN"].endswith(secret_id):
+                return s["ARN"]
+
+    #    def resolve_aws_cloudwatch_event_rule(self, logical_id, rdef):
+    #        pass
+
+    def resolve_aws_cloudwatch_event_target(self, logical_id, rdef):
+        rule = self._resolve_cache[get_refs({"rule": rdef["rule"]})[0]]
+        target_id = self.var_resolver.resolve(rdef["target_id"][0])
+        return f"{rule}/{target_id}"
+
+    def resolve_aws_sqs_queue_policy(self, logical_id, rdef):
+        return self._resolve_cache[get_refs({"queue": rdef["queue_url"]})[0]]
+
+    def resolve_aws_security_group(self, logical_id, rdef):
+        sgs = self._resolve_resources(self.get_cfn_type(logical_id))
+        hcl_ident = self.var_resolver.resolve(self.get_identity(rdef))
         for s in sgs:
             if s["GroupName"] == hcl_ident:
                 return s["GroupId"]
-        print(sgs)
 
-    def resolve_aws_iam_role(self, logical_id, hcl_ident):
-        return hcl_ident
+    def resolve_aws_kms_key(self, logical_id, rdef):
+        desc = self._value(rdef, "description")
+        if desc is None:
+            return None
+        desc = self.var_resolver.resolve(desc)
+        resources = self._resolve_resources(self.get_cfn_type(logical_id))
+        for r in resources:
+            if r["Description"] == desc:
+                return r["KeyId"]
+
+    def resolve_aws_iam_role(self, logical_id, rdef):
+        return self.var_resolver.resolve_identity(self.get_identity(rdef))
 
     def resolve_aws_sqs_queue(self, logical_id, hcl_ident):
         arn = self.resolve_default(logical_id, hcl_ident, arn=True)
@@ -193,61 +405,21 @@ class ResourceResolver:
         p = Arn.parse(arn)
         return f"https://sqs.{p.region}.amazonaws.com/{p.account_id}/{p.resource}"
 
-    def resolve_aws_elasticache_subnet_group(self, logical_id, hcl_ident):
-        return hcl_ident
+    def resolve_aws_elasticache_subnet_group(self, logical_id, rdef):
+        return self.var_resolver.resolve_identity(self.get_identity(rdef))
 
-    def resolve_aws_db_subnet_group(self, logical_id, hcl_ident):
-        return hcl_ident
+    def resolve_aws_db_subnet_group(self, logical_id, rdef):
+        return self.var_resolver.resolve_identity(self.get_identity(rdef))
 
-    def resolve_aws_ecs_service(self, logical_id, hcl_ident):
-        rdef = self.tresources[logical_id]["def"]
-        cluster_id = rdef.get("cluster", ["default"])[0]
-        return None
-        return f"{cluster_id}/{hcl_ident}"
+    def resolve_aws_ecs_service(self, logical_id, rdef):
+        cluster = get_refs({"cluster": rdef["cluster"]})[0]
+        cluster_id = self._resolve_cache[cluster]
+        service_name = self.var_resolver.resolve(rdef["name"][0])
+        return f"{cluster_id}/{service_name}"
 
-    def resolve_aws_cloudwatch_log_group(self, logical_id, hcl_ident):
-        name = self.resolve_default(logical_id, hcl_ident)
+    def resolve_aws_cloudwatch_log_group(self, logical_id, rdef):
+        name = self.resolve_default(logical_id, rdef)
         return f"/{name}"
-
-
-def sorted_graph(tresources):
-    """sort the dependencies by the resource graph dependency order"""
-    graph = defaultdict(list)
-    for t in tresources:
-        tdef = tresources[t]["def"]
-        for r in get_refs(tdef):
-            if not r.startswith("aws"):
-                continue
-            graph[t].append(r)
-
-    pprint.pprint(graph)
-    ts = TopologicalSorter(graph)
-    sorder = list(ts.static_order())
-    # kms keys have no real user managed identity, minus an alias
-    # we can bind their identity from their aliases, so resort aliases
-    # first, by just moving kms keys to the rear
-    rorder = [t for t in sorder if not t.startswith("aws_kms_key")]
-    [rorder.append(t) for t in sorder if t.startswith("aws_kms_key")]
-    pprint.pprint(rorder)
-    return rorder
-
-
-TF_REF_REGEX = re.compile("\$\{(?P<ref>.*?)\}")
-
-
-def get_refs(tdef):
-    refs = []
-    for k, v in tdef.items():
-        for e in v:
-            if not isinstance(e, str):
-                continue
-            elif "${aws_" in e:
-                for r in TF_REF_REGEX.search(e).groups("ref"):
-                    if "aws" in r:
-                        refs.append(r.rsplit(".", 1)[0])
-            elif "aws_" in e:
-                refs.append(e)
-    return refs
 
 
 def get_diff(group, tfdir, tf_vars, tf_locals, ident_map):
@@ -258,52 +430,22 @@ def get_diff(group, tfdir, tf_vars, tf_locals, ident_map):
     log.info(
         "found %d of %d resources missing in state" % (len(remainder), len(tresources))
     )
-    resource_resolver = ResourceResolver(eresources, tresources, sresources, ident_map)
+
+    variable_resolver = VariableResolver(tf_vars, tf_locals)
+    resource_resolver = ResourceResolver(
+        variable_resolver, eresources, tresources, sresources, ident_map
+    )
     rdiff = {}
 
+    only = set("rule")
     for r in sorted_graph(tresources):
-        # print(f"{rservice} {rtype} {tresources[r]}")
-        ident = tresources[r]["id"]
-        if "var." in ident or "local." in ident:
-            rident = resolve_ident_variable(ident, tf_vars, tf_locals)
-            # log.info('resolve identity %s -> %s', ident, rident)
-            ident = rident
-
-        found = resource_resolver.resolve(r, ident)
+        rdef = tresources[r]["def"]
+        found = resource_resolver.resolve(r, rdef)
         if found:
             rdiff[r] = found
         else:
-            log.info("no candidates for %s %s", r, ident)
+            log.info("no candidates for %s\n %s", r, rdef)
     return rdiff
-
-
-def get_regex(name, var=False, local=False):
-    assert var or local
-    if var:
-        return re.compile("((?:\$\{)?var[.]" + name + "(?:\})?)")
-    if local:
-        return re.compile("((?:\$\{)?local[.]" + name + "(?:\})?)")
-
-
-def resolve_ident_variable(ident, tf_vars, tf_locals):
-    for k in sorted(tf_vars.keys(), key=lambda x: len(x), reverse=True):
-        if f"var.{k}" not in ident:
-            continue
-        regex = get_regex(k, var=True)
-        v = tf_vars[k]
-        if isinstance(v, list):
-            v = v[0]
-        ident = regex.sub(v, ident)
-
-    for k in sorted(tf_locals.keys(), key=lambda x: len(x), reverse=True):
-        if f"local.{k}" not in ident:
-            continue
-        v = tf_locals[k]
-        if isinstance(v, list):
-            v = v[0]
-        regex = get_regex(k, local=True)
-        ident = regex.sub(v, ident)
-    return ident
 
 
 def get_vars(var_files):
