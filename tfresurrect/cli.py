@@ -61,6 +61,7 @@ def get_state_resources(tf_dir):
 
 def get_hcl_resources(tf_dir):
     resources = {}
+    variables = {}
 
     for tf in Path(str(tf_dir)).rglob("**/*.tf"):
         tf_data = hcl2.loads(tf.read_text())
@@ -70,12 +71,17 @@ def get_hcl_resources(tf_dir):
                 rdef = r[rtype][rname]
                 resources[f"{rtype}.{rname}"] = {"def": rdef}
 
+        for tvar in tf_data.get("variable", ()):
+            for k, v in tvar.items():
+                if v.get("default") is not None:
+                    variables[k] = v["default"][0]
+
     for tfjson in Path(str(tf_dir)).rglob("**/*.tf.json"):
         tf_data = json.loads(tfjson.read_text())
         for rtype, rset in tf_data.get("resource").items():
             for rname, rdef in rset.items():
                 resources[f"{rtype}.{rname}"] = {"def": arrayify(rdef)}
-    return resources
+    return resources, variables
 
 
 def arrayify(n):
@@ -97,6 +103,8 @@ def get_graph(tresources):
             if not r.startswith("aws"):
                 continue
             graph[t].append(r)
+        else:
+            graph[t] = []
     return graph
 
 
@@ -348,6 +356,12 @@ class ResourceResolver:
         self._clients[service] = client = boto3.client(service)
         return client
 
+    def resolve_aws_s3_bucket(self, logical_id, rdef):
+        return self.var_resolver.resolve(rdef["bucket"][0])
+
+    def resolve_aws_elasticsearch_domain(self, logical_id, rdef):
+        return self.var_resolver.resolve(rdef["domain_name"][0])
+
     def resolve_aws_cloudwatch_event_bus(self, logical_id, rdef):
         return self.var_resolver.resolve(rdef["name"][0])
 
@@ -375,7 +389,7 @@ class ResourceResolver:
         return
 
     def resolve_aws_ecr_repository_policy(self, logical_id, rdef):
-        return self.var_resolver.resolve(rdef["repository"][0])
+        return self._resolve_ref(get_refs({"repo": rdef["repository"]})[0])
 
     def resolve_aws_api_gateway_rest_api(self, logical_id, rdef):
         resources = self._resolve_resources(self.get_cfn_type(logical_id), env=False)
@@ -435,8 +449,21 @@ class ResourceResolver:
         return None
 
     def resolve_aws_lb_listener(self, logical_id, rdef):
-        # todo
-        return None
+        lb_arn = self._resolve_ref(get_refs({"balance": rdef["load_balancer_arn"]})[0])
+        client = self._client("elbv2")
+        listeners = client.describe_listeners(LoadBalancerArn=lb_arn).get(
+            "Listeners", ()
+        )
+        port = int(rdef["port"][0])
+        protocol = rdef["protocol"][0]
+        found = None
+        for l in listeners:
+            if l["Port"] != port:
+                continue
+            if l["Protocol"] != protocol:
+                continue
+            found = l
+        return found and found["ListenerArn"] or found
 
     def resolve_aws_api_gateway_base_path_mapping(self, logical_id, rdef):
         domain = self.var_resolver.resolve(rdef["domain_name"][0])
@@ -449,7 +476,7 @@ class ResourceResolver:
         func = self._resolve_ref(get_refs({"func": rdef["function_name"]})[0])
         if source.startswith("aws_dynamodb_table"):
             resources = self._resolve_resources(
-                "aws::dynamodb::table", rids=(self._resolve_cache[source],)
+                "aws::dynamodb::table", rids=(self._resolve_ref(source),)
             )
             stream_arn = resources[0]["LatestStreamArn"]
             try:
@@ -460,8 +487,10 @@ class ResourceResolver:
                 return
         elif "sqs" in rdef["event_source_arn"][0]:
             sqs = get_refs({"source": [rdef["event_source_arn"][0].rsplit(":")[-1]]})
+            sqs_def = self.tresources[sqs[0]]
             queue_url = self._resolve_ref(sqs[0])
             name = queue_url.rsplit("/", 1)[-1]
+
             queue_arn = f"arn:aws:sqs:{self.region}:{self.account_id}:{name}"
             try:
                 return client.list_event_source_mappings(
@@ -644,9 +673,12 @@ class ResourceResolver:
         name = self.resolve_default(logical_id, rdef)
         return f"/{name}"
 
+    def resolve_aws_ssm_parameter(self, logical_id, rdef):
+        return self.var_resolver.resolve(rdef["name"][0])
+
 
 def get_diff(group, tfdir, tf_vars, tf_locals, ident_map):
-    tresources = get_hcl_resources(tfdir)
+    tresources, variables = get_hcl_resources(tfdir)
     sresources = get_state_resources(tfdir)
     eresources = get_env_resources(group)
     remainder = set(tresources) - set(sresources)
@@ -654,13 +686,18 @@ def get_diff(group, tfdir, tf_vars, tf_locals, ident_map):
         "found %d of %d resources missing in state" % (len(remainder), len(tresources))
     )
 
-    variable_resolver = VariableResolver(tf_vars, tf_locals)
+    variables.update(tf_vars)
+    variable_resolver = VariableResolver(variables, tf_locals)
     resource_resolver = ResourceResolver(
         variable_resolver, eresources, tresources, sresources, ident_map
     )
     rdiff = {}
 
     for r in sorted_graph(tresources):
+        if r == "aws_ssm_parameter.platform_config":
+            import pdb
+
+            pdb.set_trace()
         if r not in remainder:
             continue
         if r in ident_map:
@@ -726,7 +763,7 @@ def init_group(name, tags):
 @click.option("-d", "--tfdir", default=".")
 def gen_import_config(tfdir):
     """provide a skeleton for manual imports"""
-    tresources = get_hcl_resources(tfdir)
+    tresources, variables = get_hcl_resources(tfdir)
     print(json.dumps({i: None for i in sorted(tresources)}, indent=2))
 
 
@@ -734,7 +771,7 @@ def gen_import_config(tfdir):
 @click.option("-d", "--tfdir", default=".")
 def resource_graph(tfdir):
     """show dependencies between terraform resources"""
-    tresources = get_hcl_resources(tfdir)
+    tresources, variables = get_hcl_resources(tfdir)
     g = get_graph(tresources)
     order = sorted_graph(tresources)
     # rebuild graph dict in sorted dep order
