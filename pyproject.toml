@@ -6,12 +6,11 @@ authors = ["Kapil Thangavelu <hello@stacklet.io>"]
 license = "Apache 2.0"
 
 [tool.poetry.scripts]
-tfresurrect = 'tfresurrect.cli:cli'
+tfresurrect = "tfresurrect.cli:cli"
 
 [tool.poetry.dependencies]
 python = "^3.8"
 python-hcl2 = "^2.0.3"
-pytest-terraform = "^0.5.3"
 c7n = "^0.9.11"
 
 [tool.poetry.dev-dependencies]
