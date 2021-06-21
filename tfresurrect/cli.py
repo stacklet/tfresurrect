@@ -108,6 +108,12 @@ def get_graph(tresources):
                 graph[t] = []
     return graph
 
+def build_resource_id(name, tdef):
+    if "count" in tdef:
+        return f"{name}[0]"
+    if "for_each" in tdef:
+        log.warn("Unable to handle for_each", name, tdef)
+    return name
 
 def sorted_graph(tresources):
     """sort the dependencies by the resource graph dependency order
@@ -735,17 +741,18 @@ def get_diff(group, tfdir, tf_vars, tf_locals, ident_map):
     rdiff = {}
 
     for r in sorted_graph(tresources):
+        rdef = tresources[r]["def"]
+        rname = build_resource_id(r, rdef)
         if r not in remainder:
             continue
         if r in ident_map:
-            rdiff[r] = ident_map[r]
+            rdiff[rname] = ident_map[r]
             continue
-        rdef = tresources[r]["def"]
         found = resource_resolver.resolve(r, rdef)
         if found:
-            rdiff[r] = found
+            rdiff[rname] = found
         else:
-            log.info("no candidates for %s\n %s", r, rdef)
+            log.info("no candidates for %s\n %s", rname, rdef)
     return rdiff
 
 
