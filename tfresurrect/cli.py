@@ -104,7 +104,8 @@ def get_graph(tresources):
                 continue
             graph[t].append(r)
         else:
-            graph[t] = []
+            if t.startswith("aws"):
+                graph[t] = []
     return graph
 
 
@@ -145,8 +146,8 @@ class VariableResolver:
         self.tf_locals = tf_locals
 
     def resolve_identity(self, ident):
-        ident = self._resolve_variables(ident)
         ident = self._resolve_locals(ident)
+        ident = self._resolve_variables(ident)
         return ident
 
     resolve = resolve_identity
@@ -196,6 +197,7 @@ class ResourceResolver:
         "aws::elasticache::subnet_group": "aws::elasticache::subnetgroup",
         "aws::sfn::statemachine": "AWS::StepFunctions::StateMachine".lower(),
         "aws::api::gatewayrestapi": "aws::apigateway::restapi",
+        "aws::acm::certificate": "AWS::CertificateManager::Certificate".lower(),
     }
     hcl_type = {"aws_lb": "AWS::ElasticLoadBalancingV2::LoadBalancer".lower()}
 
@@ -355,6 +357,42 @@ class ResourceResolver:
             return self._clients[service]
         self._clients[service] = client = boto3.client(service)
         return client
+
+    def resolve_aws_cognito_user_pool(self, logical_id, rdef):
+        name = self.var_resolver.resolve(rdef["name"][0])
+        resources = self._resolve_resources(self.get_cfn_type(logical_id), env=False)
+        for r in resources:
+            if r["Name"] == name:
+                return r["Id"]
+
+    def resolve_aws_acm_certificate(self, logical_id, rdef):
+        domain_name = self.var_resolver.resolve(rdef["domain_name"][0])
+        resources = self._resolve_resources(self.get_cfn_type(logical_id), env=False)
+        for r in resources:
+            if r["DomainName"] == domain_name:
+                return r["CertificateArn"]
+
+    def resolve_aws_cognito_identity_provider(self, logical_id, rdef):
+        # ugh... too much indirection can.
+        # look for a user pool in this same stack
+        keys = [
+            k
+            for k in self._resolve_cache.keys()
+            if k.startswith("aws_cognito_user_pool.")
+        ]
+        name = self.var_resolver.resolve(rdef["provider_name"][0])
+        if keys:
+            pool_id = self._resolve_ref(keys[0])
+            return "%s:%s" % (pool_id, name)
+
+    def resolve_aws_cognito_user_pool_domain(self, logical_id, rdef):
+        return self.var_resolver.resolve(rdef["domain"][0])
+
+    def resolve_aws_s3_bucket_public_access_block(self, logical_id, rdef):
+        return self.var_resolver.resolve(rdef["bucket"][0])
+
+    def resolve_aws_s3_bucket_object(self, logical_id, rdef):
+        return
 
     def resolve_aws_s3_bucket(self, logical_id, rdef):
         return self.var_resolver.resolve(rdef["bucket"][0])
@@ -614,6 +652,9 @@ class ResourceResolver:
     def resolve_aws_cloudwatch_event_target(self, logical_id, rdef):
         rule = self._resolve_ref(get_refs({"rule": rdef["rule"]})[0])
         target_id = self.var_resolver.resolve(rdef["target_id"][0])
+        ref = get_refs({"t": [target_id]})[0]
+        if ref:
+            target_id = self._resolve_ref(ref).split("/")[-1]
         return f"{rule}/{target_id}"
 
     def resolve_aws_sqs_queue_policy(self, logical_id, rdef):
@@ -694,10 +735,6 @@ def get_diff(group, tfdir, tf_vars, tf_locals, ident_map):
     rdiff = {}
 
     for r in sorted_graph(tresources):
-        if r == "aws_ssm_parameter.platform_config":
-            import pdb
-
-            pdb.set_trace()
         if r not in remainder:
             continue
         if r in ident_map:
@@ -836,7 +873,10 @@ def sync(tfdir, group, vars_file, locals_file, ident_map):
         iargs = list(args)
         iargs.append(logical_id)
         iargs.append(physical_id)
-        subprocess.check_call(iargs)
+        try:
+            subprocess.check_call(iargs)
+        except subprocess.CalledProcessError as e:
+            print("error on %s %s\n %s" % (logical_id, physical_id, str(e)))
 
 
 if __name__ == "__main__":
