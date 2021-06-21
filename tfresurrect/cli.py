@@ -3,15 +3,14 @@ import click
 from collections import defaultdict
 from graphlib import TopologicalSorter
 from c7n.resources import load_resources
-from c7n.resources.aws import Arn, ArnResolver, AWS
+from c7n.resources.aws import Arn, AWS
 from c7n.policy import Policy
 from c7n.config import Config
+from c7n.utils import filter_empty
 import jmespath
 import json
 import logging
 import hcl2
-import itertools
-import os
 import pprint
 from pathlib import Path
 import re
@@ -24,15 +23,17 @@ __author__ = "Kapil Thangavelu <kapil@stacklet.io>"
 log = logging.getLogger("tfresurrect")
 
 
+class AmbigiousError(ValueError):
+    pass
+
+
 def get_env_resources(group):
     # https://docs.aws.amazon.com/ARG/latest/userguide/supported-resources.html
     # lots of notables, iam roles, lambda layers, ecs services, etc
     client = boto3.client("resource-groups")
-    group_info = client.get_group(Group=group).get("Group")
     group_resources = client.list_group_resources(Group=group).get(
         "ResourceIdentifiers"
     )
-
     env_resources = {}
     for r in group_resources:
         env_resources.setdefault(r["ResourceType"].lower(), []).append(r["ResourceArn"])
@@ -69,11 +70,7 @@ def get_hcl_resources(tf_dir):
     return resources
 
 
-def sorted_graph(tresources):
-    """sort the dependencies by the resource graph dependency order
-
-    dependencies determined by references between resources.
-    """
+def get_graph(tresources):
     graph = defaultdict(list)
     for t in tresources:
         tdef = tresources[t]["def"]
@@ -81,19 +78,19 @@ def sorted_graph(tresources):
             if not r.startswith("aws"):
                 continue
             graph[t].append(r)
-
-    ts = TopologicalSorter(graph)
-    sorder = list(ts.static_order())
-    # kms keys have no real user managed identity, minus an alias
-    # we can bind their identity from their aliases, so resort aliases
-    # first, by just moving kms keys to the rear
-    # rorder = [t for t in sorder if not t.startswith("aws_kms_key")]
-    # $[rorder.append(t) for t in sorder if t.startswith("aws_kms_key")]
-    # pprint.pprint(rorder)
-    return sorder
+    return graph
 
 
-TF_REF_REGEX = re.compile("\$\{(?P<ref>.*?)\}")
+def sorted_graph(tresources):
+    """sort the dependencies by the resource graph dependency order
+
+    dependencies determined by references between resources.
+    """
+    ts = TopologicalSorter(get_graph(tresources))
+    return ts.static_order()
+
+
+TF_REF_REGEX = re.compile("\$\{(?P<ref>.*?)\}")  # noqa
 
 
 def get_refs(tdef):
@@ -131,9 +128,9 @@ class VariableResolver:
     def get_regex(name, var=False, local=False):
         assert var or local
         if var:
-            return re.compile("((?:\$\{)?var[.]" + name + "(?:\})?)")
+            return re.compile("((?:\$\{)?var[.]" + name + "(?:\})?)")  # noqa
         if local:
-            return re.compile("((?:\$\{)?local[.]" + name + "(?:\})?)")
+            return re.compile("((?:\$\{)?local[.]" + name + "(?:\})?)")  # noqa
 
     def _resolve_variables(self, ident):
         for k in sorted(self.tf_vars.keys(), key=lambda x: len(x), reverse=True):
@@ -193,7 +190,6 @@ class ResourceResolver:
         self.rmanager = Policy(
             {"name": "resolver", "resource": "aws.ec2"}, Config.empty()
         ).resource_manager
-        self.arn_resolver = ArnResolver(self.rmanager)
 
     def get_cfn_type(self, logical_id):
         provider, rservice, rtype = logical_id.split(".", 1)[0].split("_", 2)
@@ -264,6 +260,16 @@ class ResourceResolver:
             return parsed_arn.resource
         return found
 
+    def _resolve_ref(self, logical_id):
+        if logical_id in self._resolve_cache:
+            return self._resolve_cache[logical_id]
+        elif logical_id in self.tstate:
+            return self.tstate[logical_id]["id"]
+        elif logical_id in self.ident_map:
+            return self.ident_map[logical_id]
+        else:
+            raise ValueError("unknown logical id %s" % logical_id)
+
     def _resolve_resources(self, cfn_type, rids=None):
         if cfn_type in self._resource_cache:
             return self._resource_cache[cfn_type]
@@ -297,12 +303,12 @@ class ResourceResolver:
     def resolve_aws_iam_role_policy_attachment(self, logical_id, rdef):
         role_refs = get_refs({"role": rdef["role"]})
         if role_refs:
-            role = self._resolve_cache[role_refs[0]]
+            role = self._resolve_ref(role_refs[0])
         else:
             role = rdef["role"][0]
         policy_refs = get_refs({"policy_arn": rdef["policy_arn"]})
         if policy_refs:
-            policy = self._resolve_cache[policy_refs[0]]
+            policy = self._resolve_ref(policy_refs[0])
         else:
             policy = rdef["policy_arn"][0]
         return f"{role}/{policy}"
@@ -316,13 +322,13 @@ class ResourceResolver:
 
     def resolve_aws_security_group_rule(self, logical_id, rdef):
         ref_sg_id = get_refs({"sg_id": rdef["security_group_id"]})[0]
-        sg_id = self._resolve_cache[ref_sg_id]
+        sg_id = self._resolve_ref(ref_sg_id)
         direction = rdef["type"][0]
         protocol = rdef["protocol"][0]
 
         source_group = get_refs({"sg": rdef.get("source_security_group_id", ())})
         if source_group:
-            source_group = self._resolve_cache[source_group[0]]
+            source_group = self._resolve_ref(source_group[0])
 
         blocks = []
         for b in rdef.get("cidr_blocks", ()):
@@ -344,7 +350,7 @@ class ResourceResolver:
         return f"{sg_id}_{direction}_{protocol}_{from_port}_{to_port}_{cidr}"
 
     def resolve_aws_iam_role_policy(self, logical_id, rdef):
-        role = self._resolve_cache[get_refs({"role": rdef["role"]})[0]]
+        role = self._resolve_ref(get_refs({"role": rdef["role"]})[0])
         name = self.var_resolver.resolve(rdef["name"][0])
         return f"{role}:{name}"
 
@@ -358,25 +364,21 @@ class ResourceResolver:
         secret_ref = get_refs({"secret": rdef["secret_id"]})
         if not secret_ref:
             return None
-        secret_id = self._resolve_cache[secret_ref[0]]
-
+        secret_id = self._resolve_ref(secret_ref[0])
         name = secret_id.rsplit("-", 1)[0]
         secrets = self._resolve_resources("aws::secretsmanager::secret", rids=(name,))
-        found = None
         for s in secrets:
             if s["ARN"].endswith(secret_id):
-                return s["ARN"]
-
-    #    def resolve_aws_cloudwatch_event_rule(self, logical_id, rdef):
-    #        pass
+                version_id = list(s["VersionIdsToStages"]).pop(0)
+                return "%s|%s" % (s["ARN"], version_id)
 
     def resolve_aws_cloudwatch_event_target(self, logical_id, rdef):
-        rule = self._resolve_cache[get_refs({"rule": rdef["rule"]})[0]]
+        rule = self._resolve_ref(get_refs({"rule": rdef["rule"]})[0])
         target_id = self.var_resolver.resolve(rdef["target_id"][0])
         return f"{rule}/{target_id}"
 
     def resolve_aws_sqs_queue_policy(self, logical_id, rdef):
-        return self._resolve_cache[get_refs({"queue": rdef["queue_url"]})[0]]
+        return self._resolve_ref(get_refs({"queue": rdef["queue_url"]})[0])
 
     def resolve_aws_security_group(self, logical_id, rdef):
         sgs = self._resolve_resources(self.get_cfn_type(logical_id))
@@ -391,9 +393,22 @@ class ResourceResolver:
             return None
         desc = self.var_resolver.resolve(desc)
         resources = self._resolve_resources(self.get_cfn_type(logical_id))
+
+        # we generally early exit, but description is a pretty weak
+        # user specified identity and there are large consequences
+        # wrt to storage changes on kms, so double check.
+        results = []
         for r in resources:
             if r["Description"] == desc:
-                return r["KeyId"]
+                results.append(r["KeyId"])
+        if len(results) > 1:
+            raise AmbigiousError(
+                (
+                    "aws_kms_key ambigious description ('%s') use identity"
+                    "file.\n found multiple keys %s"
+                )
+                % (desc, ", ".join(results))
+            )
 
     def resolve_aws_iam_role(self, logical_id, rdef):
         return self.var_resolver.resolve_identity(self.get_identity(rdef))
@@ -412,10 +427,12 @@ class ResourceResolver:
         return self.var_resolver.resolve_identity(self.get_identity(rdef))
 
     def resolve_aws_ecs_service(self, logical_id, rdef):
-        cluster = get_refs({"cluster": rdef["cluster"]})[0]
-        cluster_id = self._resolve_cache[cluster]
+
+        cluster = self._resolve_ref(get_refs({"cluster": rdef["cluster"]})[0])
+        if cluster.startswith("arn:"):
+            cluster = Arn.parse(cluster).resource
         service_name = self.var_resolver.resolve(rdef["name"][0])
-        return f"{cluster_id}/{service_name}"
+        return f"{cluster}/{service_name}"
 
     def resolve_aws_cloudwatch_log_group(self, logical_id, rdef):
         name = self.resolve_default(logical_id, rdef)
@@ -437,8 +454,12 @@ def get_diff(group, tfdir, tf_vars, tf_locals, ident_map):
     )
     rdiff = {}
 
-    only = set("rule")
     for r in sorted_graph(tresources):
+        if r not in remainder:
+            continue
+        if r in ident_map:
+            rdiff[r] = ident_map[r]
+            continue
         rdef = tresources[r]["def"]
         found = resource_resolver.resolve(r, rdef)
         if found:
@@ -475,7 +496,7 @@ def init_group(name, tags):
     """Create a Resource Group for extant resources"""
     client = boto3.client("resource-groups")
     try:
-        group = client.get_group(Group=name)
+        client.get_group(Group=name)
     except client.exceptions.NotFoundException:
         pass
     else:
@@ -498,8 +519,20 @@ def init_group(name, tags):
 @cli.command()
 @click.option("-d", "--tfdir", default=".")
 def gen_import_config(tfdir):
+    """provide a skeleton for manual imports"""
     tresources = get_hcl_resources(tfdir)
     print(json.dumps({i: None for i in sorted(tresources)}, indent=2))
+
+
+@cli.command()
+@click.option("-d", "--tfdir", default=".")
+def resource_graph(tfdir):
+    """show dependencies between terraform resources"""
+    tresources = get_hcl_resources(tfdir)
+    g = get_graph(tresources)
+    order = sorted_graph(tresources)
+    # rebuild graph dict in sorted dep order
+    print(json.dumps({o: g[o] for o in order}, indent=2))
 
 
 @cli.command()
@@ -509,18 +542,13 @@ def gen_import_config(tfdir):
 @click.option("-l", "--locals-file", type=click.Path(), multiple=True)
 @click.option("-i", "--ident-map", type=click.Path())
 def diff(group, tfdir, vars_file, locals_file, ident_map):
-    """Three way diff
-
-    environment resources
-    terraform state file
-    terraform hcl
-    """
+    """Three way diff"""
     load_resources(("aws.*",))
 
     tf_vars = get_vars(vars_file)
     tf_locals = get_vars(locals_file)
     if ident_map:
-        ident_map = json.loads(Path(ident_map).read_text())
+        ident_map = filter_empty(json.loads(Path(ident_map).read_text()))
     rdiff = get_diff(group, tfdir, tf_vars, tf_locals, ident_map or ())
     if not rdiff:
         log.info("no diff found")
@@ -544,12 +572,12 @@ def show_env_resources(group):
 @click.option("-l", "--locals-file", type=click.Path(), multiple=True)
 @click.option("-i", "--ident-map", type=click.Path())
 def sync(tfdir, group, vars_file, locals_file, ident_map):
-
+    """import resources"""
     tf_vars = get_vars(vars_file)
     tf_locals = get_vars(locals_file)
 
     if ident_map:
-        ident_map = json.loads(Path(ident_map).read_text())
+        ident_map = filter_empty(json.loads(Path(ident_map).read_text()))
     load_resources(("aws.*",))
 
     rdiff = get_diff(group, tfdir, tf_vars, tf_locals, ident_map or ())
@@ -565,16 +593,16 @@ def sync(tfdir, group, vars_file, locals_file, ident_map):
         iargs = list(args)
         iargs.append(logical_id)
         iargs.append(physical_id)
-        # subprocess.check_call(iargs)
+        subprocess.check_call(iargs)
 
 
 if __name__ == "__main__":
     try:
         cli()
-    except SystemExit:
+    except (SystemExit, AmbigiousError):
         raise
-    except:
-        import traceback, sys, pdb
+    except:  # noqa
+        import traceback, sys, pdb  # noqa
 
         traceback.print_exc()
         pdb.post_mortem(sys.exc_info()[-1])
