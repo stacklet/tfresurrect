@@ -2,8 +2,11 @@
 name = "tfresurrect"
 version = "0.1.0"
 description = "resurrect terraform state"
-authors = ["Kapil Thangavelu <kapilt@gmail.com>"]
+authors = ["Kapil Thangavelu <hello@stacklet.io>"]
 license = "Apache 2.0"
+
+[tool.poetry.scripts]
+tfresurrect = 'tfresurrect.cli:cli'
 
 [tool.poetry.dependencies]
 python = "^3.8"
