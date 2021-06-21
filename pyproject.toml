@@ -9,7 +9,7 @@ license = "Apache 2.0"
 tfresurrect = "tfresurrect.cli:cli"
 
 [tool.poetry.dependencies]
-python = "^3.8"
+python = "^3.9"
 python-hcl2 = "^2.0.3"
 c7n = "^0.9.11"
 
