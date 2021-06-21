@@ -67,7 +67,24 @@ def get_hcl_resources(tf_dir):
             for rname in r[rtype].keys():
                 rdef = r[rtype][rname]
                 resources[f"{rtype}.{rname}"] = {"def": rdef}
+
+    for tfjson in Path(str(tf_dir)).rglob("**/*.tf.json"):
+        tf_data = json.loads(tfjson.read_text())
+        for rtype, rset in tf_data.get("resource").items():
+            for rname, rdef in rset.items():
+                resources[f"{rtype}.{rname}"] = {"def": arrayify(rdef)}
     return resources
+
+
+def arrayify(n):
+    for k, v in list(n.items()):
+        if isinstance(v, dict):
+            arrayify(v)
+        elif isinstance(v, list):
+            continue
+        elif isinstance(v, (int, str, bool)):
+            n[k] = [v]
+    return n
 
 
 def get_graph(tresources):
