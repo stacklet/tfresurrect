@@ -476,7 +476,7 @@ class ResourceResolver:
             t = self._resolve_ref(tname)
         except ValueError:
             self.resolve(tname, self.tresources[tname]["def"])
-        t = self._resolve_ref(tname)
+            t = self._resolve_ref(tname)
         return client.list_subscriptions_by_topic(TopicArn=t,).get("Subscriptions")[
             0
         ]["SubscriptionArn"]
