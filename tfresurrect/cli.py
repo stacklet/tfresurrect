@@ -378,6 +378,17 @@ class ResourceResolver:
             if r["DomainName"] == domain_name:
                 return r["CertificateArn"]
 
+    def resolve_aws_route53_record(self, logical_id, rdef):
+        if "for_each" in rdef:
+            # Skip trying to resolve for_each loop'd records.
+            return ""
+        zone_id = self.var_resolver.resolve(rdef["zone_id"][0])
+        domain_name = self.var_resolver.resolve(rdef["name"][0])
+        if "${" in domain_name:
+            log.info("Skipping due to unresolved variable", logical_id, domain_name, rdef)
+            return ""
+        return f"{zone_id}_{domain_name}_{rdef['type'][0]}"
+
     def resolve_aws_cognito_identity_provider(self, logical_id, rdef):
         # ugh... too much indirection can.
         # look for a user pool in this same stack
