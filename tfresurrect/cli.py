@@ -7,6 +7,8 @@ from c7n.resources.aws import Arn, AWS
 from c7n.policy import Policy
 from c7n.config import Config
 from c7n.utils import filter_empty
+from c7n.manager import resources as c7n_resources
+from c7n.query import ChildResourceManager, TypeInfo
 import jmespath
 import json
 import logging
@@ -26,6 +28,21 @@ log = logging.getLogger("tfresurrect")
 
 class AmbigiousError(ValueError):
     pass
+
+
+@c7n_resources.register('user-pool-client')
+class CognitoUserPoolClient(ChildResourceManager):
+
+    class resource_type(TypeInfo):
+        service = "cognito-idp"
+        parent_spec = ('user-pool', 'UserPoolId', None)
+        enum_spec = ('list_user_pool_clients', 'UserPoolClients', {'MaxResults': 60})
+        # detail_spec = (
+        #     'describe_user_pool_client', 'ClientId', 'UserPoolId', )
+        id = 'ClientId'
+        name = 'ClientName'
+        arn_type = "userpoolclient"
+        cfn_type = 'AWS::Cognito::UserPoolClient'
 
 
 def get_env_resources(group):
@@ -370,6 +387,13 @@ class ResourceResolver:
         for r in resources:
             if r["Name"] == name:
                 return r["Id"]
+
+    def resolve_aws_cognito_user_pool_client(self, logical_id, rdef):
+        user_pool = self.var_resolver.resolve(rdef["user_pool_id"][0])
+        resources = self._resolve_resources(self.get_cfn_type(logical_id), env=False)
+        for r in resources:
+            if r["UserPoolId"] == user_pool:
+                return f"{user_pool}/{r['ClientId']}"
 
     def resolve_aws_acm_certificate(self, logical_id, rdef):
         domain_name = self.var_resolver.resolve(rdef["domain_name"][0])
