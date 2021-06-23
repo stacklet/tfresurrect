@@ -129,7 +129,7 @@ def build_resource_id(name, tdef):
     if "count" in tdef:
         return f"{name}[0]"
     if "for_each" in tdef:
-        log.warn("Unable to handle for_each", name, tdef)
+        log.info(f"Unable to handle for_each {name} - {tdef}")
     return name
 
 def sorted_graph(tresources):
@@ -409,7 +409,7 @@ class ResourceResolver:
         zone_id = self.var_resolver.resolve(rdef["zone_id"][0])
         domain_name = self.var_resolver.resolve(rdef["name"][0])
         if "${" in domain_name:
-            log.info("Skipping due to unresolved variable", logical_id, domain_name, rdef)
+            log.info(f"Skipping due to unresolved variable {logical_id}, {domain_name}, {rdef}")
             return None
         return f"{zone_id}_{domain_name}_{rdef['type'][0]}"
 
