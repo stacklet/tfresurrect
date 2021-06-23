@@ -7,10 +7,13 @@ from c7n.resources.aws import Arn, AWS
 from c7n.policy import Policy
 from c7n.config import Config
 from c7n.utils import filter_empty
+from c7n.manager import resources as c7n_resources
+from c7n.query import ChildResourceManager, TypeInfo
 import jmespath
 import json
 import logging
 import hcl2
+import operator
 import pprint
 from pathlib import Path
 import re
@@ -27,12 +30,28 @@ class AmbigiousError(ValueError):
     pass
 
 
+@c7n_resources.register('user-pool-client')
+class CognitoUserPoolClient(ChildResourceManager):
+
+    class resource_type(TypeInfo):
+        service = "cognito-idp"
+        parent_spec = ('user-pool', 'UserPoolId', None)
+        enum_spec = ('list_user_pool_clients', 'UserPoolClients', {'MaxResults': 60})
+        # detail_spec = (
+        #     'describe_user_pool_client', 'ClientId', 'UserPoolId', )
+        id = 'ClientId'
+        name = 'ClientName'
+        arn_type = "userpoolclient"
+        cfn_type = 'AWS::Cognito::UserPoolClient'
+
+
 def get_env_resources(group):
     # https://docs.aws.amazon.com/ARG/latest/userguide/supported-resources.html
     # lots of notables, iam roles, lambda layers, ecs services, etc
     client = boto3.client("resource-groups")
-    group_resources = client.list_group_resources(Group=group).get(
-        "ResourceIdentifiers"
+    pager = client.get_paginator("list_group_resources")
+    group_resources = (
+        pager.paginate(Group=group).build_full_result().get("ResourceIdentifiers")
     )
     env_resources = {}
     for r in group_resources:
@@ -59,6 +78,7 @@ def get_state_resources(tf_dir):
 
 def get_hcl_resources(tf_dir):
     resources = {}
+    variables = {}
 
     for tf in Path(str(tf_dir)).rglob("**/*.tf"):
         tf_data = hcl2.loads(tf.read_text())
@@ -68,12 +88,17 @@ def get_hcl_resources(tf_dir):
                 rdef = r[rtype][rname]
                 resources[f"{rtype}.{rname}"] = {"def": rdef}
 
+        for tvar in tf_data.get("variable", ()):
+            for k, v in tvar.items():
+                if v.get("default") is not None:
+                    variables[k] = v["default"][0]
+
     for tfjson in Path(str(tf_dir)).rglob("**/*.tf.json"):
         tf_data = json.loads(tfjson.read_text())
         for rtype, rset in tf_data.get("resource").items():
             for rname, rdef in rset.items():
                 resources[f"{rtype}.{rname}"] = {"def": arrayify(rdef)}
-    return resources
+    return resources, variables
 
 
 def arrayify(n):
@@ -95,8 +120,17 @@ def get_graph(tresources):
             if not r.startswith("aws"):
                 continue
             graph[t].append(r)
+        else:
+            if t.startswith("aws"):
+                graph[t] = []
     return graph
 
+def build_resource_id(name, tdef):
+    if "count" in tdef:
+        return f"{name}[0]"
+    if "for_each" in tdef:
+        log.info(f"Unable to handle for_each {name} - {tdef}")
+    return name
 
 def sorted_graph(tresources):
     """sort the dependencies by the resource graph dependency order
@@ -135,8 +169,8 @@ class VariableResolver:
         self.tf_locals = tf_locals
 
     def resolve_identity(self, ident):
-        ident = self._resolve_variables(ident)
         ident = self._resolve_locals(ident)
+        ident = self._resolve_variables(ident)
         return ident
 
     resolve = resolve_identity
@@ -182,8 +216,13 @@ class ResourceResolver:
         "aws::db::instance": "aws::rds::dbinstance",
         "aws::cloudwatch::eventrule": "aws::events::rule",
         "aws::cloudwatch::loggroup": "aws::logs::loggroup",
+        "aws::lb::targetgroup": "AWS::ElasticLoadBalancingV2::TargetGroup".lower(),
         "aws::elasticache::subnet_group": "aws::elasticache::subnetgroup",
+        "aws::sfn::statemachine": "AWS::StepFunctions::StateMachine".lower(),
+        "aws::api::gatewayrestapi": "aws::apigateway::restapi",
+        "aws::acm::certificate": "AWS::CertificateManager::Certificate".lower(),
     }
+    hcl_type = {"aws_lb": "AWS::ElasticLoadBalancingV2::LoadBalancer".lower()}
 
     arn_imports = set()
 
@@ -202,14 +241,25 @@ class ResourceResolver:
         self.ident_map = ident_map
         self._resolve_cache = {}
         self._resource_cache = {}
+        self._clients = {}
+
+        client = boto3.client("sts")
+        # we try to not to use this but in some cases we're generating arns.
+        self.account_id = client.get_caller_identity().get("Account")
+        self.region = client.meta.region_name
 
         # dynamic lookup
         self.rmanager = Policy(
-            {"name": "resolver", "resource": "aws.ec2"}, Config.empty()
+            {"name": "resolver", "resource": "aws.ec2"},
+            Config.empty(region=self.region, account_id=self.account_id),
         ).resource_manager
 
     def get_cfn_type(self, logical_id):
-        provider, rservice, rtype = logical_id.split(".", 1)[0].split("_", 2)
+        tf_type = logical_id.split(".", 1)[0]
+        if tf_type in self.hcl_type:
+            return self.hcl_type[tf_type]
+
+        provider, rservice, rtype = tf_type.split("_", 2)
         rtype = rtype.replace("_", "")
         etype = f"{provider}::{rservice}::{rtype}"
         return self.hcl_cfn_type_map.get(etype, etype)
@@ -284,10 +334,14 @@ class ResourceResolver:
             return self.tstate[logical_id]["id"]
         elif logical_id in self.ident_map:
             return self.ident_map[logical_id]
+        elif logical_id in self.tresources:
+            # hack to get around bad dep order due to issue in get refs with multiple vars
+            self.resolve(logical_id, self.tresources[logical_id]["def"])
+            return self._resolve_ref(logical_id)
         else:
             raise ValueError("unknown logical id %s" % logical_id)
 
-    def _resolve_resources(self, cfn_type, rids=None):
+    def _resolve_resources(self, cfn_type, rids=None, env=True):
         if cfn_type in self._resource_cache:
             return self._resource_cache[cfn_type]
         found = None
@@ -301,21 +355,260 @@ class ResourceResolver:
             raise ValueError(
                 "could not find matching resource for cfn_type:%s" % cfn_type
             )
-
         kmanager = self.rmanager.get_resource_manager(rtype)
-        if not rids:
+        cache = True
+        if rids:
+            cache = False
+        if not rids and env is True:
             candidates = self.eresources.get(cfn_type, ())
-            if not candidates:
-                return None
             rids = [Arn.parse(c).resource for c in candidates]
-        resources = kmanager.get_resources(rids)
-        self._resource_cache[cfn_type] = resources
+        if rids:
+            resources = kmanager.get_resources(rids)
+        else:
+            resources = kmanager.resources()
+        if cache:
+            self._resource_cache[cfn_type] = resources
         return resources
 
     def _value(self, rdef, key):
         v = rdef.get(key)
         if isinstance(v, list):
             return v[0]
+
+    def _client(self, service):
+        if service in self._clients:
+            return self._clients[service]
+        self._clients[service] = client = boto3.client(service)
+        return client
+
+    def resolve_aws_cognito_user_pool(self, logical_id, rdef):
+        name = self.var_resolver.resolve(rdef["name"][0])
+        resources = self._resolve_resources(self.get_cfn_type(logical_id), env=False)
+        for r in resources:
+            if r["Name"] == name:
+                return r["Id"]
+
+    def resolve_aws_cognito_user_pool_client(self, logical_id, rdef):
+        user_pool = self.var_resolver.resolve(rdef["user_pool_id"][0])
+        resources = self._resolve_resources(self.get_cfn_type(logical_id), env=False)
+        for r in resources:
+            if r["UserPoolId"] == user_pool:
+                return f"{user_pool}/{r['ClientId']}"
+
+    def resolve_aws_acm_certificate(self, logical_id, rdef):
+        domain_name = self.var_resolver.resolve(rdef["domain_name"][0])
+        resources = self._resolve_resources(self.get_cfn_type(logical_id), env=False)
+        for r in resources:
+            if r["DomainName"] == domain_name:
+                return r["CertificateArn"]
+
+    def resolve_aws_route53_record(self, logical_id, rdef):
+        if "for_each" in rdef:
+            # Skip trying to resolve for_each loop'd records.
+            return None
+        zone_id = self.var_resolver.resolve(rdef["zone_id"][0])
+        domain_name = self.var_resolver.resolve(rdef["name"][0])
+        if "${" in domain_name:
+            log.info(f"Skipping due to unresolved variable {logical_id}, {domain_name}, {rdef}")
+            return None
+        return f"{zone_id}_{domain_name}_{rdef['type'][0]}"
+
+    def resolve_aws_cognito_identity_provider(self, logical_id, rdef):
+        # ugh... too much indirection can.
+        # look for a user pool in this same stack
+        keys = [
+            k
+            for k in self._resolve_cache.keys()
+            if k.startswith("aws_cognito_user_pool.")
+        ]
+        name = self.var_resolver.resolve(rdef["provider_name"][0])
+        if keys:
+            pool_id = self._resolve_ref(keys[0])
+            return "%s:%s" % (pool_id, name)
+
+    def resolve_aws_cognito_user_pool_domain(self, logical_id, rdef):
+        return self.var_resolver.resolve(rdef["domain"][0])
+
+    def resolve_aws_s3_bucket_public_access_block(self, logical_id, rdef):
+        return self.var_resolver.resolve(rdef["bucket"][0])
+
+    def resolve_aws_s3_bucket_object(self, logical_id, rdef):
+        return
+
+    def resolve_aws_s3_bucket(self, logical_id, rdef):
+        return self.var_resolver.resolve(rdef["bucket"][0])
+
+    def resolve_aws_elasticsearch_domain(self, logical_id, rdef):
+        return self.var_resolver.resolve(rdef["domain_name"][0])
+
+    def resolve_aws_cloudwatch_event_bus(self, logical_id, rdef):
+        return self.var_resolver.resolve(rdef["name"][0])
+
+    def resolve_aws_lambda_layer_version(self, logical_id, rdef):
+        resources = self._resolve_resources(self.get_cfn_type(logical_id))
+        name = self.var_resolver.resolve(rdef["layer_name"][0])
+        candidates = []
+        for r in resources:
+            if r["LayerName"] == name:
+                candidates.append(r)
+        candidates = sorted(
+            candidates, key=operator.itemgetter("Version"), reverse=True
+        )
+        if candidates:
+            return candidates[0]["LayerVersionArn"]
+
+    def resolve_aws_elasticsearch_domain_policy(self, logical_id, rdef):
+        # terraform doesn't support import on this afaics
+        # https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/elasticsearch_domain_policy
+        return
+
+    def resolve_aws_acm_certificate_validation(self, logical_id, rdef):
+        # terraform doesn't support import on this afaics
+        # https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/acm_certificate_validation
+        return
+
+    def resolve_aws_ecr_repository_policy(self, logical_id, rdef):
+        return self._resolve_ref(get_refs({"repo": rdef["repository"]})[0])
+
+    def resolve_aws_api_gateway_rest_api(self, logical_id, rdef):
+        resources = self._resolve_resources(self.get_cfn_type(logical_id), env=False)
+        name = self.var_resolver.resolve(rdef["name"][0])
+        for r in resources:
+            if r["name"] == name:
+                return r["id"]
+
+    def resolve_aws_api_gateway_domain_name(self, logical_id, rdef):
+        return self.var_resolver.resolve(rdef["domain_name"][0])
+
+    def resolve_aws_sns_topic(self, logical_id, rdef):
+        name = self.var_resolver.resolve(rdef["name"][0])
+        return "arn:aws:sns:{region}:{account_id}:{name}".format(
+            region=self.region, account_id=self.account_id, name=name
+        )
+
+    def resolve_aws_sns_topic_subscription(self, logical_id, rdef):
+        client = self._client("sns")
+        topic = rdef["topic_arn"][0]
+
+        if "chalice" in topic:
+            tname = get_refs({"topic": [topic.rsplit(":", 1)[-1]]})[0]
+        else:
+            tname = get_refs({"topic": [topic]})[0]
+
+        # ugly due to lack of chalice arn ref parsing
+        try:
+            t = self._resolve_ref(tname)
+        except ValueError:
+            self.resolve(tname, self.tresources[tname]["def"])
+            t = self._resolve_ref(tname)
+        return client.list_subscriptions_by_topic(TopicArn=t,).get("Subscriptions")[
+            0
+        ]["SubscriptionArn"]
+
+    def resolve_aws_lb(self, logical_id, rdef):
+        name = self.var_resolver.resolve(rdef["name"][0])
+        resources = self._resolve_resources(self.get_cfn_type(logical_id), rids=(name,))
+        if resources:
+            return resources[0]["LoadBalancerArn"]
+
+    def resolve_aws_lb_target_group(self, logical_id, rdef):
+        name = self.var_resolver.resolve(rdef["name"][0])
+        resources = self._resolve_resources(self.get_cfn_type(logical_id), env=False)
+        for r in resources:
+            if r["TargetGroupName"] == name:
+                return r["TargetGroupArn"]
+
+    def resolve_aws_lb_target_group_attachment(self, logical_id, rdef):
+        # not supported
+        # https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/lb_target_group_attachment
+        return None
+
+    def resolve_aws_api_gateway_deployment(self, logical_id, rdef):
+        # not supported afaics
+        return None
+
+    def resolve_aws_lb_listener(self, logical_id, rdef):
+        lb_arn = self._resolve_ref(get_refs({"balance": rdef["load_balancer_arn"]})[0])
+        client = self._client("elbv2")
+        listeners = client.describe_listeners(LoadBalancerArn=lb_arn).get(
+            "Listeners", ()
+        )
+        port = int(rdef["port"][0])
+        protocol = rdef["protocol"][0]
+        found = None
+        for l in listeners:
+            if l["Port"] != port:
+                continue
+            if l["Protocol"] != protocol:
+                continue
+            found = l
+        return found and found["ListenerArn"] or found
+
+    def resolve_aws_api_gateway_base_path_mapping(self, logical_id, rdef):
+        domain = self.var_resolver.resolve(rdef["domain_name"][0])
+        path = rdef.get("base_path", ("/",))[0]
+        return f"{domain}{path}"
+
+    def resolve_aws_lambda_event_source_mapping(self, logical_id, rdef):
+        client = self._client("lambda")
+        source = get_refs({"source": rdef["event_source_arn"]})[0]
+        func = self._resolve_ref(get_refs({"func": rdef["function_name"]})[0])
+        if source.startswith("aws_dynamodb_table"):
+            resources = self._resolve_resources(
+                "aws::dynamodb::table", rids=(self._resolve_ref(source),)
+            )
+            stream_arn = resources[0]["LatestStreamArn"]
+            try:
+                return client.list_event_source_mappings(
+                    EventSourceArn=stream_arn, FunctionName=func
+                ).get("EventSourceMappings")[0]["UUID"]
+            except IndexError:
+                return
+        elif "sqs" in rdef["event_source_arn"][0]:
+            sqs = get_refs({"source": [rdef["event_source_arn"][0].rsplit(":")[-1]]})
+            sqs_def = self.tresources[sqs[0]]
+            queue_url = self._resolve_ref(sqs[0])
+            name = queue_url.rsplit("/", 1)[-1]
+
+            queue_arn = f"arn:aws:sqs:{self.region}:{self.account_id}:{name}"
+            try:
+                return client.list_event_source_mappings(
+                    EventSourceArn=queue_arn, FunctionName=func
+                ).get("EventSourceMappings")[0]["UUID"]
+            except IndexError:
+                return
+        else:
+            raise NotImplementedError("unsupport stream type %s" % source)
+
+    def resolve_aws_lambda_permission(self, logical_id, rdef):
+        # if its not a qualified statement then its automagic
+        func = self._resolve_ref(get_refs({"func": rdef["function_name"]})[0])
+        if "statement_id" in rdef:
+            sid = self.var_resolver.resolve(rdef["statement_id"][0])
+            return f"{func}/{sid}"
+        client = self._client("lambda")
+        data = json.loads(client.get_policy(FunctionName=func).get("Policy")) or {}
+        for s in data.get("Statement", ()):
+            if s["Action"] != rdef["action"][0]:
+                continue
+            if s["Principal"].get("Service") != rdef["principal"][0]:
+                continue
+            sid = s["Sid"]
+        return f"{func}/{sid}"
+
+    def resolve_aws_sfn_state_machine(self, logical_id, rdef):
+        name = self.var_resolver.resolve(rdef["name"][0])
+        return "arn:aws:states:{region}:{account_id}:stateMachine:{name}".format(
+            region=self.region, account_id=self.account_id, name=name
+        )
+
+    def resolve_aws_lambda_function(self, logical_id, rdef):
+        return self.var_resolver.resolve(rdef["function_name"][0])
+
+    def resolve_aws_iam_policy(self, logical_id, rdef):
+        return "arn:aws:iam::{account_id}:policy/{name}".format(
+            account_id=self.account_id, name=self.var_resolver.resolve(rdef["name"][0])
+        )
 
     def resolve_aws_iam_role_policy_attachment(self, logical_id, rdef):
         role_refs = get_refs({"role": rdef["role"]})
@@ -389,9 +682,20 @@ class ResourceResolver:
                 version_id = list(s["VersionIdsToStages"]).pop(0)
                 return "%s|%s" % (s["ARN"], version_id)
 
+    def resolve_aws_cloudwatch_event_rule(self, logical_id, rdef):
+        if "event_bus_name" in rdef:
+            bus = self._resolve_ref(get_refs({"bus": rdef["event_bus_name"]})[0])
+        else:
+            bus = "default"
+        name = self.var_resolver.resolve(rdef["name"][0])
+        return f"{bus}/{name}"
+
     def resolve_aws_cloudwatch_event_target(self, logical_id, rdef):
         rule = self._resolve_ref(get_refs({"rule": rdef["rule"]})[0])
         target_id = self.var_resolver.resolve(rdef["target_id"][0])
+        ref = get_refs({"t": [target_id]})[0]
+        if ref:
+            target_id = self._resolve_ref(ref).split("/")[-1]
         return f"{rule}/{target_id}"
 
     def resolve_aws_sqs_queue_policy(self, logical_id, rdef):
@@ -428,14 +732,11 @@ class ResourceResolver:
             )
 
     def resolve_aws_iam_role(self, logical_id, rdef):
-        return self.var_resolver.resolve_identity(self.get_identity(rdef))
+        return self.var_resolver.resolve(self.get_identity(rdef))
 
-    def resolve_aws_sqs_queue(self, logical_id, hcl_ident):
-        arn = self.resolve_default(logical_id, hcl_ident, arn=True)
-        if not arn:
-            return arn
-        p = Arn.parse(arn)
-        return f"https://sqs.{p.region}.amazonaws.com/{p.account_id}/{p.resource}"
+    def resolve_aws_sqs_queue(self, logical_id, rdef):
+        name = self.var_resolver.resolve(self.get_identity(rdef))
+        return f"https://sqs.{self.region}.amazonaws.com/{self.account_id}/{name}"
 
     def resolve_aws_elasticache_subnet_group(self, logical_id, rdef):
         return self.var_resolver.resolve_identity(self.get_identity(rdef))
@@ -444,7 +745,6 @@ class ResourceResolver:
         return self.var_resolver.resolve_identity(self.get_identity(rdef))
 
     def resolve_aws_ecs_service(self, logical_id, rdef):
-
         cluster = self._resolve_ref(get_refs({"cluster": rdef["cluster"]})[0])
         if cluster.startswith("arn:"):
             cluster = Arn.parse(cluster).resource
@@ -455,9 +755,12 @@ class ResourceResolver:
         name = self.resolve_default(logical_id, rdef)
         return f"/{name}"
 
+    def resolve_aws_ssm_parameter(self, logical_id, rdef):
+        return self.var_resolver.resolve(rdef["name"][0])
+
 
 def get_diff(group, tfdir, tf_vars, tf_locals, ident_map):
-    tresources = get_hcl_resources(tfdir)
+    tresources, variables = get_hcl_resources(tfdir)
     sresources = get_state_resources(tfdir)
     eresources = get_env_resources(group)
     remainder = set(tresources) - set(sresources)
@@ -465,24 +768,26 @@ def get_diff(group, tfdir, tf_vars, tf_locals, ident_map):
         "found %d of %d resources missing in state" % (len(remainder), len(tresources))
     )
 
-    variable_resolver = VariableResolver(tf_vars, tf_locals)
+    variables.update(tf_vars)
+    variable_resolver = VariableResolver(variables, tf_locals)
     resource_resolver = ResourceResolver(
         variable_resolver, eresources, tresources, sresources, ident_map
     )
     rdiff = {}
 
     for r in sorted_graph(tresources):
+        rdef = tresources[r]["def"]
+        rname = build_resource_id(r, rdef)
         if r not in remainder:
             continue
         if r in ident_map:
-            rdiff[r] = ident_map[r]
+            rdiff[rname] = ident_map[r]
             continue
-        rdef = tresources[r]["def"]
         found = resource_resolver.resolve(r, rdef)
         if found:
-            rdiff[r] = found
+            rdiff[rname] = found
         else:
-            log.info("no candidates for %s\n %s", r, rdef)
+            log.info("no candidates for %s\n %s", rname, rdef)
     return rdiff
 
 
@@ -537,7 +842,7 @@ def init_group(name, tags):
 @click.option("-d", "--tfdir", default=".")
 def gen_import_config(tfdir):
     """provide a skeleton for manual imports"""
-    tresources = get_hcl_resources(tfdir)
+    tresources, variables = get_hcl_resources(tfdir)
     print(json.dumps({i: None for i in sorted(tresources)}, indent=2))
 
 
@@ -545,7 +850,7 @@ def gen_import_config(tfdir):
 @click.option("-d", "--tfdir", default=".")
 def resource_graph(tfdir):
     """show dependencies between terraform resources"""
-    tresources = get_hcl_resources(tfdir)
+    tresources, variables = get_hcl_resources(tfdir)
     g = get_graph(tresources)
     order = sorted_graph(tresources)
     # rebuild graph dict in sorted dep order
@@ -610,7 +915,10 @@ def sync(tfdir, group, vars_file, locals_file, ident_map):
         iargs = list(args)
         iargs.append(logical_id)
         iargs.append(physical_id)
-        subprocess.check_call(iargs)
+        try:
+            subprocess.check_call(iargs)
+        except subprocess.CalledProcessError as e:
+            print("error on %s %s\n %s" % (logical_id, physical_id, str(e)))
 
 
 if __name__ == "__main__":
