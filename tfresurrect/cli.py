@@ -693,9 +693,9 @@ class ResourceResolver:
     def resolve_aws_cloudwatch_event_target(self, logical_id, rdef):
         rule = self._resolve_ref(get_refs({"rule": rdef["rule"]})[0])
         target_id = self.var_resolver.resolve(rdef["target_id"][0])
-        ref = get_refs({"t": [target_id]})[0]
+        ref = get_refs({"t": [target_id]})
         if ref:
-            target_id = self._resolve_ref(ref).split("/")[-1]
+            target_id = self._resolve_ref(ref[0]).split("/")[-1]
         return f"{rule}/{target_id}"
 
     def resolve_aws_sqs_queue_policy(self, logical_id, rdef):
