@@ -12,6 +12,7 @@ tfresurrect = "tfresurrect.cli:cli"
 python = "^3.9"
 c7n = "^0.9.11"
 bc-python-hcl2 = "^0.3.18"
+click = "^8.0.3"
 
 [tool.poetry.dev-dependencies]
 pytest = "^6.2.4"
