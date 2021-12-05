@@ -30,19 +30,18 @@ class AmbigiousError(ValueError):
     pass
 
 
-@c7n_resources.register('user-pool-client')
+@c7n_resources.register("user-pool-client")
 class CognitoUserPoolClient(ChildResourceManager):
-
     class resource_type(TypeInfo):
         service = "cognito-idp"
-        parent_spec = ('user-pool', 'UserPoolId', None)
-        enum_spec = ('list_user_pool_clients', 'UserPoolClients', {'MaxResults': 60})
+        parent_spec = ("user-pool", "UserPoolId", None)
+        enum_spec = ("list_user_pool_clients", "UserPoolClients", {"MaxResults": 60})
         # detail_spec = (
         #     'describe_user_pool_client', 'ClientId', 'UserPoolId', )
-        id = 'ClientId'
-        name = 'ClientName'
+        id = "ClientId"
+        name = "ClientName"
         arn_type = "userpoolclient"
-        cfn_type = 'AWS::Cognito::UserPoolClient'
+        cfn_type = "AWS::Cognito::UserPoolClient"
 
 
 def get_env_resources(group):
@@ -125,12 +124,14 @@ def get_graph(tresources):
                 graph[t] = []
     return graph
 
+
 def build_resource_id(name, tdef):
     if "count" in tdef:
         return f"{name}[0]"
     if "for_each" in tdef:
         log.info(f"Unable to handle for_each {name} - {tdef}")
     return name
+
 
 def sorted_graph(tresources):
     """sort the dependencies by the resource graph dependency order
@@ -409,7 +410,9 @@ class ResourceResolver:
         zone_id = self.var_resolver.resolve(rdef["zone_id"][0])
         domain_name = self.var_resolver.resolve(rdef["name"][0])
         if "${" in domain_name:
-            log.info(f"Skipping due to unresolved variable {logical_id}, {domain_name}, {rdef}")
+            log.info(
+                f"Skipping due to unresolved variable {logical_id}, {domain_name}, {rdef}"
+            )
             return None
         return f"{zone_id}_{domain_name}_{rdef['type'][0]}"
 
@@ -536,7 +539,7 @@ class ResourceResolver:
         port = int(rdef["port"][0])
         protocol = rdef["protocol"][0]
         found = None
-        for l in listeners:
+        for l in listeners:  # noqa
             if l["Port"] != port:
                 continue
             if l["Protocol"] != protocol:
@@ -566,7 +569,6 @@ class ResourceResolver:
                 return
         elif "sqs" in rdef["event_source_arn"][0]:
             sqs = get_refs({"source": [rdef["event_source_arn"][0].rsplit(":")[-1]]})
-            sqs_def = self.tresources[sqs[0]]
             queue_url = self._resolve_ref(sqs[0])
             name = queue_url.rsplit("/", 1)[-1]
 
