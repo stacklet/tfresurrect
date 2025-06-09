@@ -1,9 +1,11 @@
 [tool.poetry]
 name = "tfresurrect"
-version = "0.1.0"
-description = "resurrect terraform state"
+version = "0.1.1"
+description = "resurrect terraform state from extant environment"
 authors = ["Kapil Thangavelu <hello@stacklet.io>"]
 license = "Apache 2.0"
+readme = "readme.md"
+repository = "https://github.com/stacklet/tfresurrect"
 
 [tool.poetry.scripts]
 tfresurrect = "tfresurrect.cli:cli"
