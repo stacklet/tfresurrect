@@ -13,11 +13,17 @@ Don't panic :-)
 
 # Usage
 
+
+first make sure that terraform providers are initialized
+```
+terraform init
+```
+
 Create a resource group to identify extant things in the environment
 that were created by terraform.
 
 ```
-tfresurrect init-group -g assetdb-sandbox -t "Env=sandbox" -t "App=AssetDB" -t "Owner=kapil@stacklet.io"
+tfresurrect init -g assetdb-sandbox -t "Env=sandbox" -t "App=AssetDB" -t "Owner=kapil@stacklet.io"
 ```
 
 let's look at the resources we are able to discover using tags
@@ -37,7 +43,7 @@ mappings of terraform resources to physical resources manually. tfresurrect
 can generate a mapping file for us to fill in
 
 ```
-tfresurrect gen-identity
+tfresurrect gen-import-config
 ```
 
 we can pass the identity file to `sync` and `diff` commands via `-i identify_file.json`
