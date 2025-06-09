@@ -142,12 +142,14 @@ def sorted_graph(tresources):
     return ts.static_order()
 
 
-TF_REF_REGEX = re.compile("\$\{(?P<ref>.*?)\}")  # noqa
+TF_REF_REGEX = re.compile(r"\$\{(?P<ref>.*?)\}")  # noqa
 
 
 def get_refs(tdef):
     refs = []
     for k, v in tdef.items():
+        if k in ['__start_line__', '__end_line__']:
+            continue
         for e in v:
             if not isinstance(e, str):
                 continue
@@ -180,9 +182,9 @@ class VariableResolver:
     def get_regex(name, var=False, local=False):
         assert var or local
         if var:
-            return re.compile("((?:\$\{)?var[.]" + name + "(?:\})?)")  # noqa
+            return re.compile(r"((?:\$\{)?var[.]" + name + r"(?:\})?)")  # noqa
         if local:
-            return re.compile("((?:\$\{)?local[.]" + name + "(?:\})?)")  # noqa
+            return re.compile(r"((?:\$\{)?local[.]" + name + r"(?:\})?)")  # noqa
 
     def _resolve_variables(self, ident):
         for k in sorted(self.tf_vars.keys(), key=lambda x: len(x), reverse=True):
